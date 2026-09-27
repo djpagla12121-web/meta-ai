@@ -1,0 +1,6 @@
+{
+  "name": "Arafat Tools Panel",
+  "description": "Tools Panel for Telegram Bot with Firebase integration, Facebook & Meta account creation, and Proxy configuration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
