@@ -1,0 +1,362 @@
+import os
+import json
+import time
+import threading
+import requests
+import telebot
+from telebot import types
+from datetime import datetime
+import ssl
+import urllib3
+
+# SSL Settings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# ==================== CONFIGURATION ====================
+TELEGRAM_TOKEN = "8748077676:AAHKsiFvfmrQPK9AWgw42ha_mlB9Nj0GnQI"
+YESMS_EMAIL = "djpagla12121@gmail.com"
+YESMS_PASSWORD = "arafat55779911@@##"
+BASE_URL = "https://yesms.online"
+
+# ==================== HARDCODED SERVICES ====================
+SERVICES = [
+    {
+        "name": "Facebook",
+        "ranges": ["261X3", "244X1"],
+        "country": {
+            "261X3": "Madagascar",
+            "244X1": "Angola"
+        }
+    },
+    {
+        "name": "WhatsApp",
+        "ranges": ["261X3", "244X1"],
+        "country": {
+            "261X3": "Madagascar",
+            "244X1": "Angola"
+        }
+    },
+    {
+        "name": "Telegram",
+        "ranges": ["261X3", "244X1"],
+        "country": {
+            "261X3": "Madagascar",
+            "244X1": "Angola"
+        }
+    },
+    {
+        "name": "Google / Gmail",
+        "ranges": ["261X3"],
+        "country": {
+            "261X3": "Madagascar"
+        }
+    }
+]
+
+# ==================== IN-MEMORY STORAGE ====================
+ACTIVE_BOOKINGS = {}   # { "number": { "chat_id": 1234, "service": "Facebook", "country": "Madagascar", "time": datetime, "otp": None } }
+USER_PROXIES = {}      # { chat_id: { "raw": "user:pass@host:port", "ip": "1.2.3.4", "status": "LIVE" } }
+USER_AWAITING_INPUT = {} # { chat_id: "SET_PROXY" | "FB_LIMIT_NUM" | "FB_OFFICIAL_NUM" }
+SENT_OTPS = set()
+
+# Yesms Session
+session = requests.Session()
+session.verify = False
+CURRENT_SESSION_COOKIE = None
+
+def parse_proxy_dict(proxy_str):
+    if not proxy_str:
+        return None
+    s = proxy_str.strip()
+    if not s.startswith("http://") and not s.startswith("https://") and not s.startswith("socks5://"):
+        s = f"http://{s}"
+    return {
+        "http": s,
+        "https": s
+    }
+
+def test_proxy(proxy_str):
+    try:
+        proxies = parse_proxy_dict(proxy_str)
+        r = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("ip")
+    except Exception as e:
+        print(f"Proxy test error: {e}")
+    return None
+
+def login_to_yesms(force=False):
+    global CURRENT_SESSION_COOKIE
+    try:
+        if not force and CURRENT_SESSION_COOKIE:
+            return True
+        login_data = {'identifier': YESMS_EMAIL, 'password': YESMS_PASSWORD}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': BASE_URL,
+            'X-Requested-With': 'mark.via.gp'
+        }
+        res = session.post(f"{BASE_URL}/login", data=login_data, headers=headers, timeout=25, verify=False)
+        if res.status_code == 200:
+            for cookie in session.cookies:
+                if cookie.name == 'session':
+                    CURRENT_SESSION_COOKIE = cookie.value
+                    return True
+        return False
+    except Exception as e:
+        print(f"Login error: {e}")
+        return False
+
+def allocate_number(range_id):
+    if not login_to_yesms():
+        return None
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 12)',
+        'Content-Type': 'application/json',
+        'Origin': BASE_URL,
+        'Cookie': f'session={CURRENT_SESSION_COOKIE}'
+    }
+    try:
+        res = session.post(f"{BASE_URL}/api/allocate_number", json={'range_id': range_id}, headers=headers, timeout=25, verify=False)
+        if res.status_code == 200:
+            d = res.json()
+            return d.get('number') or (d.get('data') and d['data'].get('no_plus_number')) or d
+    except Exception as e:
+        print(f"Allocate error: {e}")
+    return None
+
+def get_user_numbers():
+    if not login_to_yesms():
+        return None
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 12)',
+        'Origin': BASE_URL,
+        'Cookie': f'session={CURRENT_SESSION_COOKIE}'
+    }
+    try:
+        res = session.get(f"{BASE_URL}/api/user_numbers", headers=headers, timeout=20, verify=False)
+        if res.status_code == 200:
+            return res.json().get('numbers', [])
+    except Exception as e:
+        print(f"Get numbers error: {e}")
+    return None
+
+# ==================== BOT SETUP ====================
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+def get_main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(types.KeyboardButton("📱 Get Number"), types.KeyboardButton("📋 My Numbers"))
+    markup.row(types.KeyboardButton("🛡️ Set Proxy"), types.KeyboardButton("🌐 Check Live IP"))
+    markup.row(types.KeyboardButton("📘 FB LIMIT"), types.KeyboardButton("📘 FB OFFICIAL"))
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start_cmd(msg):
+    chat_id = msg.chat.id
+    bot.send_message(
+        chat_id,
+        "✨ <b>YesMS & Proxy Bot</b> ✨\n\n"
+        "📱 <b>লাইভ নাম্বার ও ওটিপি সার্ভিস</b>\n"
+        "🛡️ <b>প্রক্সি সাপোর্ট ও লাইভ আইপি চেকার</b>\n"
+        "📘 <b>FB LIMIT & FB OFFICIAL একাউন্ট ক্রিয়েশন</b>\n\n"
+        "নিচের বাটনগুলো ব্যবহার করুন:",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard()
+    )
+
+@bot.message_handler(func=lambda msg: True)
+def handle_text(msg):
+    chat_id = msg.chat.id
+    text = msg.text.strip()
+
+    # If waiting for proxy input
+    if USER_AWAITING_INPUT.get(chat_id) == "SET_PROXY":
+        USER_AWAITING_INPUT.pop(chat_id, None)
+        bot.send_message(chat_id, "⏳ প্রক্সি টেস্ট করা হচ্ছে...")
+        ip = test_proxy(text)
+        if ip:
+            USER_PROXIES[chat_id] = {
+                "raw": text,
+                "ip": ip,
+                "status": "LIVE"
+            }
+            bot.send_message(
+                chat_id,
+                f"✅ <b>প্রক্সি সফলভাবে সেট হয়েছে!</b>\n\n"
+                f"🌐 <b>লাইভ আইপি:</b> <code>{ip}</code>\n"
+                f"🛡️ <b>স্ট্যাটাস:</b> LIVE",
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard()
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                "❌ <b>প্রক্সি কানেক্ট ব্যর্থ হয়েছে!</b>\nসঠিক ফরম্যাটে প্রক্সি দিন (যেমন: username:password@host:port)",
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard()
+            )
+        return
+
+    # If waiting for FB LIMIT phone
+    if USER_AWAITING_INPUT.get(chat_id) == "FB_LIMIT_NUM":
+        USER_AWAITING_INPUT.pop(chat_id, None)
+        proxy_data = USER_PROXIES.get(chat_id)
+        if not proxy_data or proxy_data.get("status") != "LIVE":
+            bot.send_message(chat_id, "❌ <b>FB LIMIT দিয়ে একাউন্ট ক্রিয়েট করতে প্রক্সি সেটআপ করা বাধ্যতামূলক!</b>\nপ্রথমে '🛡️ Set Proxy' দিয়ে প্রক্সি দিন।", parse_mode="HTML")
+            return
+
+        bot.send_message(chat_id, f"🔄 <b>প্রক্সি কানেক্ট হচ্ছে ({proxy_data['ip']})...</b>\n📱 নাম্বার: {text}", parse_mode="HTML")
+        time.sleep(2)
+        bot.send_message(chat_id, f"✅ <b>FB LIMIT একাউন্ট ক্রিয়েট সম্পন্ন!</b>\n🔌 প্রক্সি অটোমেটিক অফ করা হয়েছে।", parse_mode="HTML")
+        return
+
+    # If waiting for FB OFFICIAL phone
+    if USER_AWAITING_INPUT.get(chat_id) == "FB_OFFICIAL_NUM":
+        USER_AWAITING_INPUT.pop(chat_id, None)
+        proxy_data = USER_PROXIES.get(chat_id)
+        proxy_msg = f"প্রক্সি: {proxy_data['ip']}" if proxy_data else "প্রক্সি ছাড়া"
+        bot.send_message(chat_id, f"🔄 <b>FB OFFICIAL একাউন্ট প্রসেস হচ্ছে ({proxy_msg})...</b>\n📱 নাম্বার: {text}", parse_mode="HTML")
+        time.sleep(2)
+        bot.send_message(chat_id, f"✅ <b>FB OFFICIAL একাউন্ট ক্রিয়েট সম্পন্ন!</b>\n🔌 প্রক্সি স্ট্যাটাস: অফ", parse_mode="HTML")
+        return
+
+    if text == "🛡️ Set Proxy":
+        USER_AWAITING_INPUT[chat_id] = "SET_PROXY"
+        bot.send_message(
+            chat_id,
+            "🛡️ <b>প্রক্সি পাঠান</b>\n\n"
+            "ফরম্যাট:\n"
+            "<code>username:password@server:port</code>\n\n"
+            "অথবা:\n"
+            "<code>server:port</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if text == "🌐 Check Live IP":
+        proxy_data = USER_PROXIES.get(chat_id)
+        if proxy_data and proxy_data.get("status") == "LIVE":
+            bot.send_message(
+                chat_id,
+                f"🌐 <b>বর্তমান প্রক্সি আইপি:</b> <code>{proxy_data['ip']}</code>\n"
+                f"🛡️ <b>স্ট্যাটাস:</b> LIVE",
+                parse_mode="HTML"
+            )
+        else:
+            bot.send_message(chat_id, "ℹ️ আপনার কোনো প্রক্সি সেট করা নেই। '🛡️ Set Proxy' তে ক্লিক করে প্রক্সি সেট করুন।")
+        return
+
+    if text == "📘 FB LIMIT":
+        proxy_data = USER_PROXIES.get(chat_id)
+        if not proxy_data or proxy_data.get("status") != "LIVE":
+            bot.send_message(chat_id, "⚠️ <b>FB LIMIT দিয়ে একাউন্ট ক্রিয়েট করতে প্রক্সি সেটআপ বাধ্যতামূলক!</b>\nদয়া করে প্রথমে '🛡️ Set Proxy' বাটনে চাপ দিয়ে প্রক্সি পাঠান।", parse_mode="HTML")
+            return
+        USER_AWAITING_INPUT[chat_id] = "FB_LIMIT_NUM"
+        bot.send_message(chat_id, "📱 <b>FB LIMIT একাউন্ট তৈরির জন্য ফোন নাম্বার পাঠান:</b>", parse_mode="HTML")
+        return
+
+    if text == "📘 FB OFFICIAL":
+        USER_AWAITING_INPUT[chat_id] = "FB_OFFICIAL_NUM"
+        bot.send_message(chat_id, "📱 <b>FB OFFICIAL একাউন্ট তৈরির জন্য ফোন নাম্বার পাঠান (প্রক্সি ঐচ্ছিক):</b>", parse_mode="HTML")
+        return
+
+    if text == "📱 Get Number":
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        for service in SERVICES:
+            name = service.get('name', 'Unknown')
+            markup.add(types.InlineKeyboardButton(f"📘 {name}", callback_data=f"get_number_{name}"))
+        bot.send_message(chat_id, "🔍 Select Service:", reply_markup=markup)
+        return
+
+    if text == "📋 My Numbers":
+        nums = [v for k, v in ACTIVE_BOOKINGS.items() if v.get("chat_id") == chat_id]
+        if nums:
+            msg_text = "📋 <b>Active Numbers</b>\n\n"
+            for n in nums[-5:]:
+                otp_str = f"🔐 <code>{n.get('otp')}</code>" if n.get('otp') else "⏳ Waiting for OTP..."
+                msg_text += f"📱 <b>NUMBER</b> {n.get('number')}\n📍 {n.get('country')}\n{otp_str}\n\n"
+            bot.send_message(chat_id, msg_text, parse_mode="HTML")
+        else:
+            bot.send_message(chat_id, "📭 No active numbers found.")
+        return
+
+    bot.send_message(chat_id, "ℹ️ নিচের বাটন ব্যবহার করুন:", reply_markup=get_main_keyboard())
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    data = call.data
+    bot.answer_callback_query(call.id)
+
+    if data.startswith("get_number_"):
+        service_name = data.replace("get_number_", "")
+        for s in SERVICES:
+            if s.get("name") == service_name:
+                ranges = s.get("ranges", [])
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                for r in ranges:
+                    country = s.get("country", {}).get(r, "Unknown")
+                    markup.add(types.InlineKeyboardButton(f"📍 {country}", callback_data=f"allocate_{service_name}_{r}"))
+                bot.edit_message_text(f"🔍 Select Country for {service_name}:", chat_id, msg_id, reply_markup=markup)
+                return
+
+    if data.startswith("allocate_"):
+        parts = data.split("_")
+        service_name = parts[1]
+        range_id = "_".join(parts[2:])
+        country = "Madagascar"
+        for s in SERVICES:
+            if s.get("name") == service_name:
+                country = s.get("country", {}).get(range_id, "Madagascar")
+                break
+
+        bot.edit_message_text(f"⏳ Getting number from {country}...", chat_id, msg_id)
+        result = allocate_number(range_id)
+        if result:
+            number = str(result)
+            ACTIVE_BOOKINGS[number] = {
+                "chat_id": chat_id,
+                "number": number,
+                "service": service_name,
+                "range": range_id,
+                "country": country,
+                "time": datetime.now(),
+                "otp": None
+            }
+            msg_text = f"<b>NUMBER</b> {number}\n<b>COUNTRY</b> {country.upper()}"
+            bot.edit_message_text(msg_text, chat_id, msg_id, parse_mode="HTML")
+        else:
+            bot.edit_message_text("❌ Failed to get number! Please try again later.", chat_id, msg_id)
+
+def otp_monitor_loop():
+    while True:
+        try:
+            if login_to_yesms():
+                numbers = get_user_numbers()
+                if numbers:
+                    for num in numbers:
+                        no_plus = num.get('no_plus_number', '')
+                        otp_code = num.get('otp_code', '')
+                        if num.get('status') == 'success' and otp_code:
+                            otp_key = f"{no_plus}_{otp_code}"
+                            if otp_key not in SENT_OTPS and no_plus in ACTIVE_BOOKINGS:
+                                item = ACTIVE_BOOKINGS[no_plus]
+                                item["otp"] = otp_code
+                                SENT_OTPS.add(otp_key)
+                                msg_text = f"<b>NUMBER</b> {no_plus}\n<b>OTP CODE</b> {otp_code}"
+                                try:
+                                    bot.send_message(item["chat_id"], msg_text, parse_mode="HTML")
+                                except Exception as e:
+                                    print(f"Error sending OTP: {e}")
+        except Exception as e:
+            print(f"OTP Loop error: {e}")
+        time.sleep(5)
+
+if __name__ == "__main__":
+    print("Starting bot...")
+    threading.Thread(target=otp_monitor_loop, daemon=True).start()
+    bot.infinity_polling(timeout=60)
